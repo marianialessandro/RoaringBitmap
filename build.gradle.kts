@@ -32,8 +32,10 @@ subprojects {
         withType<JavaCompile> {
             options.isDeprecation = true
             options.isWarnings = true
-            options.compilerArgs = listOf("-Xlint:unchecked")
-            options.release.set(8)
+            options.compilerArgs.addAll(
+                listOf("-Xlint:unchecked", "--add-modules", "jdk.incubator.vector")
+            )
+            options.release.set(21)
         }
 
         withType<Javadoc> {
@@ -50,6 +52,8 @@ subprojects {
             maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
             // --- FINE MODIFICA ---
 
+            jvmArgs("--add-modules", "jdk.incubator.vector")
+
             val javaToolchains = project.extensions.getByType<JavaToolchainService>()
             val requestedVersion = (project.properties["testOnJava"] ?: "11").toString().toInt()
             val currentVersion = JavaVersion.current().majorVersion.toInt()
@@ -57,6 +61,10 @@ subprojects {
             javaLauncher.set(javaToolchains.launcherFor {
                 languageVersion.set(JavaLanguageVersion.of(versionToUse))
             })
+        }
+
+        withType<JavaExec> {
+            jvmArgs("--add-modules", "jdk.incubator.vector")
         }
     }
 

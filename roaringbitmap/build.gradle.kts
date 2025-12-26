@@ -9,37 +9,36 @@ buildscript {
   }
 }
 
-// Compiles solely module-info.java with Java 9 compatibility and all other
-// files with Java 8 compatibility
+// Compile module-info.java and main sources with a single Java 21 release.
 apply(plugin = "org.javamodularity.moduleplugin")
 
 
-// Unset Java 8 release applied from root project to allow modularity plugin to
+// Unset Java 21 release applied from root project to allow modularity plugin to
 // control the class file versions.
 tasks.named<JavaCompile>("compileJava") {
     options.release.set(null as Int?)
 }
 
 configure<org.javamodularity.moduleplugin.extensions.ModularityExtension> {
-    mixedJavaRelease(8)
+    standardJavaRelease(21)
 }
 
-// Unset Java 8 release applied from root project to allow modularity plugin to
-// control the class file versions.
-tasks.named<JavaCompile>("compileModuleInfoJava") {
-    options.release.set(null as Int?)
+// Unset Java 21 release applied from root project to allow modularity plugin to
+// control the class file versions when the module-info task exists.
+tasks.matching { it.name == "compileModuleInfoJava" }.configureEach {
+    (this as JavaCompile).options.release.set(null as Int?)
 }
 
 tasks.test {
     extensions.configure(org.javamodularity.moduleplugin.extensions.TestModuleOptions::class) {
-        // Avoid modules in tests so we can test against Java/JDK 8.
+        // Avoid modules in tests to keep classpath-based execution.
         setRunOnClasspath(true)
     }
 }
 
 tasks.compileTestJava {
     extensions.configure(org.javamodularity.moduleplugin.extensions.CompileTestModuleOptions::class) {
-        // Avoid modules in tests so we can test against Java/JDK 8.
+        // Avoid modules in tests to keep classpath-based compilation.
         setCompileOnClasspath(true)
     }
 }
@@ -70,6 +69,7 @@ tasks.named<JavaCompile>("compileJava11Java") {
     // Arrays.equals exists since JDK9, but we make it available for 11+ so we can test the shim by using Java 11
     // and the old way by using Java 10, which will compile the new code but not use it..
     options.release.set(9)
+    options.compilerArgs.removeAll(listOf("--add-modules", "jdk.incubator.vector"))
 }
 
 tasks.named<Jar>("jar") {
@@ -85,7 +85,7 @@ tasks.named<Jar>("jar") {
 }
 
 tasks.named<Jar>("sourcesJar") {
-    dependsOn(tasks.named("compileModuleInfoJava"))
+    dependsOn(tasks.matching { it.name == "compileModuleInfoJava" })
 }
 
 tasks.test {

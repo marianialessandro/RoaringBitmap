@@ -5,6 +5,12 @@ package org.roaringbitmap;
 
 import org.roaringbitmap.buffer.MappeableContainer;
 import org.roaringbitmap.buffer.MappeableRunContainer;
+import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.LongVector;
+import jdk.incubator.vector.ShortVector;
+import jdk.incubator.vector.VectorMask;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -26,6 +32,93 @@ import java.util.Iterator;
 public final class RunContainer extends Container implements Cloneable {
   private static final int DEFAULT_INIT_SIZE = 4;
   private static final boolean ENABLE_GALLOPING_AND = false;
+
+
+  // Vector API (incubator) accelerations.
+  // Runs are stored as interleaved (value,length) pairs in a char[].
+  private static final VectorSpecies<Short> SHORT_SPECIES = ShortVector.SPECIES_PREFERRED;
+  private static final VectorSpecies<Integer> INT_SPECIES = IntVector.SPECIES_PREFERRED;
+  private static final VectorSpecies<Long> LONG_SPECIES = LongVector.SPECIES_PREFERRED;
+
+  // Index map to gather run lengths (odd positions) from the interleaved array.
+  private static final int[] ODD_INDEX_MAP = createOddIndexMap();
+
+  // 0,1,2,... lane indices (as shorts), used to vector-fill consecutive values.
+  private static final ShortVector IOTA_SHORT = ShortVector.zero(SHORT_SPECIES).addIndex(0);
+
+  private static int[] createOddIndexMap() {
+    final int lanes = SHORT_SPECIES.length();
+    final int[] idx = new int[lanes];
+    for (int i = 0; i < lanes; ++i) {
+      idx[i] = (i << 1) + 1;
+    }
+    return idx;
+  }
+
+  /**
+   * Sum lanes of a ShortVector as unsigned 16-bit values.
+   * This uses ZERO_EXTEND_S2I when the preferred vector shapes align; otherwise it falls back to scalar.
+   */
+  private static int sumUnsignedShortLanes(ShortVector v) {
+    final int shortLanes = SHORT_SPECIES.length();
+    final int intLanes = INT_SPECIES.length();
+    final int parts = shortLanes / intLanes;
+    if (parts * intLanes != shortLanes) {
+      int s = 0;
+      for (int i = 0; i < shortLanes; ++i) {
+        s += v.lane(i) & 0xFFFF;
+      }
+      return s;
+    }
+    int s = 0;
+    for (int p = 0; p < parts; ++p) {
+      final IntVector iv =
+          (IntVector) v.convertShape(VectorOperators.ZERO_EXTEND_S2I, INT_SPECIES, p);
+      s += iv.reduceLanes(VectorOperators.ADD);
+    }
+    return s;
+  }
+
+  /**
+   * Vectorized range-intersects for a bitmap (true if any bit is set in [start,end)).
+   */
+  private static boolean intersectsBitmapRange(long[] bitmap, int start, int end) {
+    if (start >= end) {
+      return false;
+    }
+    final int firstword = start >>> 6;
+    final int endword = (end - 1) >>> 6;
+
+    if (firstword == endword) {
+      final long mask = ((~0L << start) & (~0L >>> -end));
+      return (bitmap[firstword] & mask) != 0L;
+    }
+
+    if ((bitmap[firstword] & (~0L << start)) != 0L) {
+      return true;
+    }
+    if ((bitmap[endword] & (~0L >>> -end)) != 0L) {
+      return true;
+    }
+
+    int i = firstword + 1;
+    final int limit = endword; // exclusive
+    final int lanes = LONG_SPECIES.length();
+    for (; i + lanes <= limit; i += lanes) {
+      final LongVector v = LongVector.fromArray(LONG_SPECIES, bitmap, i);
+      final VectorMask<Long> m = v.compare(VectorOperators.NE, 0L);
+      if (m.anyTrue()) {
+        return true;
+      }
+    }
+    for (; i < limit; ++i) {
+      if (bitmap[i] != 0L) {
+        return true;
+      }
+    }
+    return false;
+  }
+
 
   private static final long serialVersionUID = 1L;
 
@@ -357,50 +450,67 @@ public final class RunContainer extends Container implements Cloneable {
     return false;
   }
 
-  @Override
-  public Container and(BitmapContainer x) {
-    // could be implemented as return toBitmapOrArrayContainer().iand(x);
-    int card = this.getCardinality();
-    if (card <= ArrayContainer.DEFAULT_MAX_SIZE) {
-      // result can only be an array (assuming that we never make a RunContainer)
-      if (card > x.cardinality) {
-        card = x.cardinality;
-      }
-      ArrayContainer answer = new ArrayContainer(card);
-      answer.cardinality = 0;
-      for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-        int runStart = (this.getValue(rlepos));
-        int runEnd = runStart + (this.getLength(rlepos));
-        for (int runValue = runStart; runValue <= runEnd; ++runValue) {
-          if (x.contains((char) runValue)) { // it looks like contains() should be cheap enough if
-            // accessed sequentially
-            answer.content[answer.cardinality++] = (char) runValue;
-          }
+  
+@Override
+public Container and(BitmapContainer x) {
+  // could be implemented as return toBitmapOrArrayContainer().iand(x);
+  int card = this.getCardinality();
+  if (card <= ArrayContainer.DEFAULT_MAX_SIZE) {
+    // result can only be an array (assuming that we never make a RunContainer)
+    if (card > x.cardinality) {
+      card = x.cardinality;
+    }
+    ArrayContainer answer = new ArrayContainer(card);
+    answer.cardinality = 0;
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int runStart = this.getValue(rlepos);
+      final int runEnd = runStart + this.getLength(rlepos);
+      for (int runValue = runStart; runValue <= runEnd; ++runValue) {
+        if (x.contains((char) runValue)) { // sequential contains() should be cheap enough
+          answer.content[answer.cardinality++] = (char) runValue;
         }
       }
-      return answer;
     }
-    // we expect the answer to be a bitmap (if we are lucky)
-    BitmapContainer answer = x.clone();
-    int start = 0;
-    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int end = (this.getValue(rlepos));
-      int prevOnes = answer.cardinalityInRange(start, end);
-      Util.resetBitmapRange(answer.bitmap, start, end); // had been x.bitmap
-      answer.updateCardinality(prevOnes, 0);
-      start = end + (this.getLength(rlepos)) + 1;
-    }
-    int ones = answer.cardinalityInRange(start, BitmapContainer.MAX_CAPACITY);
-    Util.resetBitmapRange(answer.bitmap, start, BitmapContainer.MAX_CAPACITY); // had been x.bitmap
-    answer.updateCardinality(ones, 0);
-    if (answer.getCardinality() > ArrayContainer.DEFAULT_MAX_SIZE) {
-      return answer;
-    } else {
-      return answer.toArrayContainer();
-    }
+    return answer;
   }
 
-  @Override
+  // We expect the answer to be a bitmap (if we are lucky). We keep only bits that fall in our runs
+  // and clear everything else.
+  BitmapContainer answer = x.clone();
+  int start = 0;
+
+  if (answer.cardinality >= 0) {
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int runStart = this.getValue(rlepos);
+      if (start < runStart) {
+        answer.cardinality +=
+            Util.resetBitmapRangeAndCardinalityChange(answer.bitmap, start, runStart);
+      }
+      start = runStart + this.getLength(rlepos) + 1;
+    }
+    if (start < BitmapContainer.MAX_CAPACITY) {
+      answer.cardinality +=
+          Util.resetBitmapRangeAndCardinalityChange(answer.bitmap, start, BitmapContainer.MAX_CAPACITY);
+    }
+  } else {
+    // Lazy bitmaps: still apply the range clears, then recompute cardinality once.
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int runStart = this.getValue(rlepos);
+      Util.resetBitmapRange(answer.bitmap, start, runStart);
+      start = runStart + this.getLength(rlepos) + 1;
+    }
+    Util.resetBitmapRange(answer.bitmap, start, BitmapContainer.MAX_CAPACITY);
+    answer.computeCardinality();
+  }
+
+  if (answer.getCardinality() > ArrayContainer.DEFAULT_MAX_SIZE) {
+    return answer;
+  } else {
+    return answer.toArrayContainer();
+  }
+}
+
+@Override
   public Container and(RunContainer x) {
     int maxRunsAfterIntersection = nbrruns + x.nbrruns;
     RunContainer answer = new RunContainer(new char[2 * maxRunsAfterIntersection], 0);
@@ -509,16 +619,17 @@ public final class RunContainer extends Container implements Cloneable {
   }
 
   @Override
-  public int andCardinality(BitmapContainer x) {
-    // could be implemented as return toBitmapOrArrayContainer().iand(x);
-    int cardinality = 0;
-    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int runStart = this.getValue(rlepos);
-      int runEnd = runStart + this.getLength(rlepos);
-      cardinality += x.cardinalityInRange(runStart, runEnd + 1);
-    }
-    return cardinality;
+public int andCardinality(BitmapContainer x) {
+  // Fast path: directly popcount the bitmap words touched by each run.
+  int cardinality = 0;
+  final long[] bm = x.bitmap;
+  for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+    final int runStart = this.getValue(rlepos);
+    final int endExclusive = runStart + this.getLength(rlepos) + 1;
+    cardinality += Util.cardinalityInBitmapRange(bm, runStart, endExclusive);
   }
+  return cardinality;
+}
 
   @Override
   public int andCardinality(RunContainer x) {
@@ -612,50 +723,61 @@ public final class RunContainer extends Container implements Cloneable {
     return toBitmapOrArrayContainer(card).iandNot(x);
   }
 
-  @Override
-  public Container andNot(BitmapContainer x) {
-    // could be implemented as toTemporaryBitmap().iandNot(x);
-    int card = this.getCardinality();
-    if (card <= ArrayContainer.DEFAULT_MAX_SIZE) {
-      // result can only be an array (assuming that we never make a RunContainer)
-      ArrayContainer answer = new ArrayContainer(card);
-      answer.cardinality = 0;
-      for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-        int runStart = (this.getValue(rlepos));
-        int runEnd = runStart + (this.getLength(rlepos));
-        for (int runValue = runStart; runValue <= runEnd; ++runValue) {
-          if (!x.contains((char) runValue)) { // it looks like contains() should be cheap enough if
-            // accessed sequentially
-            answer.content[answer.cardinality++] = (char) runValue;
-          }
+  
+@Override
+public Container andNot(BitmapContainer x) {
+  // could be implemented as toTemporaryBitmap().iandNot(x);
+  int card = this.getCardinality();
+  if (card <= ArrayContainer.DEFAULT_MAX_SIZE) {
+    // result can only be an array (assuming that we never make a RunContainer)
+    ArrayContainer answer = new ArrayContainer(card);
+    answer.cardinality = 0;
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      int runStart = (this.getValue(rlepos));
+      int runEnd = runStart + (this.getLength(rlepos));
+      for (int runValue = runStart; runValue <= runEnd; ++runValue) {
+        if (!x.contains((char) runValue)) {
+          answer.content[answer.cardinality++] = (char) runValue;
         }
       }
-      return answer;
     }
-    // we expect the answer to be a bitmap (if we are lucky)
-    BitmapContainer answer = x.clone();
-    int lastPos = 0;
-    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int start = (this.getValue(rlepos));
-      int end = start + (this.getLength(rlepos)) + 1;
-      int prevOnes = answer.cardinalityInRange(lastPos, start);
-      int flippedOnes = answer.cardinalityInRange(start, end);
-      Util.resetBitmapRange(answer.bitmap, lastPos, start);
-      Util.flipBitmapRange(answer.bitmap, start, end);
-      answer.updateCardinality(prevOnes + flippedOnes, end - start - flippedOnes);
-      lastPos = end;
-    }
-    int ones = answer.cardinalityInRange(lastPos, BitmapContainer.MAX_CAPACITY);
-    Util.resetBitmapRange(answer.bitmap, lastPos, BitmapContainer.MAX_CAPACITY);
-    answer.updateCardinality(ones, 0);
-    if (answer.getCardinality() > ArrayContainer.DEFAULT_MAX_SIZE) {
-      return answer;
-    } else {
-      return answer.toArrayContainer();
-    }
+    return answer;
   }
 
-  @Override
+  // We expect the answer to be a bitmap (if we are lucky).
+  BitmapContainer answer = x.clone();
+  int lastPos = 0;
+
+  if (answer.cardinality >= 0) {
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int start = this.getValue(rlepos);
+      final int end = start + this.getLength(rlepos) + 1;
+      answer.cardinality += Util.resetBitmapRangeAndCardinalityChange(answer.bitmap, lastPos, start);
+      answer.cardinality += Util.flipBitmapRangeAndCardinalityChange(answer.bitmap, start, end);
+      lastPos = end;
+    }
+    answer.cardinality +=
+        Util.resetBitmapRangeAndCardinalityChange(answer.bitmap, lastPos, BitmapContainer.MAX_CAPACITY);
+  } else {
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int start = this.getValue(rlepos);
+      final int end = start + this.getLength(rlepos) + 1;
+      Util.resetBitmapRange(answer.bitmap, lastPos, start);
+      Util.flipBitmapRange(answer.bitmap, start, end);
+      lastPos = end;
+    }
+    Util.resetBitmapRange(answer.bitmap, lastPos, BitmapContainer.MAX_CAPACITY);
+    answer.computeCardinality();
+  }
+
+  if (answer.getCardinality() > ArrayContainer.DEFAULT_MAX_SIZE) {
+    return answer;
+  } else {
+    return answer.toArrayContainer();
+  }
+}
+
+@Override
   public Container andNot(RunContainer x) {
     RunContainer answer = new RunContainer(new char[2 * (this.nbrruns + x.nbrruns)], 0);
     int rlepos = 0;
@@ -1019,13 +1141,26 @@ public final class RunContainer extends Container implements Cloneable {
   }
 
   @Override
-  public int getCardinality() {
-    int sum = nbrruns; // lengths are returned -1
-    for (int k = 1; k < nbrruns * 2; k += 2) {
-      sum += valueslength[k];
-    }
-    return sum;
+public int getCardinality() {
+  final int runs = this.nbrruns;
+  int sum = runs; // each run contributes +1 (length stores the number of following contiguous values)
+  if (runs == 0) {
+    return 0;
   }
+  final int lanes = SHORT_SPECIES.length();
+  int k = 0;
+  final int limit = runs - (runs % lanes);
+  for (; k < limit; k += lanes) {
+    final int base = k << 1;
+    final ShortVector vLen =
+        ShortVector.fromCharArray(SHORT_SPECIES, valueslength, base, ODD_INDEX_MAP, 0);
+    sum += sumUnsignedShortLanes(vLen);
+  }
+  for (; k < runs; ++k) {
+    sum += valueslength[(k << 1) + 1];
+  }
+  return sum;
+}
 
   /**
    * Gets the length of the run at the index.
@@ -1409,16 +1544,17 @@ public final class RunContainer extends Container implements Cloneable {
   }
 
   @Override
-  public boolean intersects(BitmapContainer x) {
-    for (int run = 0; run < this.nbrruns; ++run) {
-      int runStart = this.getValue(run);
-      int runEnd = runStart + this.getLength(run);
-      if (x.intersects(runStart, runEnd + 1)) {
-        return true;
-      }
+public boolean intersects(BitmapContainer x) {
+  final long[] bm = x.bitmap;
+  for (int run = 0; run < this.nbrruns; ++run) {
+    final int runStart = this.getValue(run);
+    final int endExclusive = runStart + this.getLength(run) + 1;
+    if (intersectsBitmapRange(bm, runStart, endExclusive)) {
+      return true;
     }
-    return false;
   }
+  return false;
+}
 
   @Override
   public boolean intersects(RunContainer x) {
@@ -1942,27 +2078,35 @@ public final class RunContainer extends Container implements Cloneable {
     return lazyor(x).repairAfterLazy();
   }
 
-  @Override
-  public Container or(BitmapContainer x) {
-    if (isFull()) {
-      return full();
-    }
-    // could be implemented as return toTemporaryBitmap().ior(x);
-    BitmapContainer answer = x.clone();
-    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int start = (this.getValue(rlepos));
-      int end = start + (this.getLength(rlepos)) + 1;
-      int prevOnesInRange = answer.cardinalityInRange(start, end);
-      Util.setBitmapRange(answer.bitmap, start, end);
-      answer.updateCardinality(prevOnesInRange, end - start);
-    }
-    if (answer.isFull()) {
-      return full();
-    }
-    return answer;
+  
+@Override
+public Container or(BitmapContainer x) {
+  if (isFull()) {
+    return full();
   }
+  // could be implemented as return toTemporaryBitmap().ior(x);
+  BitmapContainer answer = x.clone();
+  if (answer.cardinality >= 0) {
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int start = this.getValue(rlepos);
+      final int end = start + this.getLength(rlepos) + 1;
+      answer.cardinality += Util.setBitmapRangeAndCardinalityChange(answer.bitmap, start, end);
+    }
+  } else {
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int start = this.getValue(rlepos);
+      final int end = start + this.getLength(rlepos) + 1;
+      Util.setBitmapRange(answer.bitmap, start, end);
+    }
+    answer.computeCardinality();
+  }
+  if (answer.isFull()) {
+    return full();
+  }
+  return answer;
+}
 
-  @Override
+@Override
   public Container or(RunContainer x) {
     if (isFull()) {
       return full();
@@ -2304,32 +2448,39 @@ public final class RunContainer extends Container implements Cloneable {
    * @param card the current cardinality
    * @return new container
    */
-  Container toBitmapOrArrayContainer(int card) {
-    // int card = this.getCardinality();
-    if (card <= ArrayContainer.DEFAULT_MAX_SIZE) {
-      ArrayContainer answer = new ArrayContainer(card);
-      answer.cardinality = 0;
-      for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-        int runStart = (this.getValue(rlepos));
-        int runEnd = runStart + (this.getLength(rlepos));
-
-        for (int runValue = runStart; runValue <= runEnd; ++runValue) {
-          answer.content[answer.cardinality++] = (char) runValue;
-        }
-      }
-      return answer;
-    }
-    BitmapContainer answer = new BitmapContainer();
+  
+Container toBitmapOrArrayContainer(int card) {
+  if (card <= ArrayContainer.DEFAULT_MAX_SIZE) {
+    ArrayContainer answer = new ArrayContainer(card);
+    int outPos = 0;
+    final int lanes = SHORT_SPECIES.length();
     for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int start = (this.getValue(rlepos));
-      int end = start + (this.getLength(rlepos)) + 1;
-      Util.setBitmapRange(answer.bitmap, start, end);
+      int v = this.getValue(rlepos);
+      int remaining = this.getLength(rlepos) + 1; // number of values in this run
+      while (remaining >= lanes) {
+        IOTA_SHORT.add((short) v).intoCharArray(answer.content, outPos);
+        outPos += lanes;
+        v += lanes;
+        remaining -= lanes;
+      }
+      for (int t = 0; t < remaining; ++t) {
+        answer.content[outPos++] = (char) (v + t);
+      }
     }
-    answer.cardinality = card;
+    answer.cardinality = outPos;
     return answer;
   }
+  BitmapContainer answer = new BitmapContainer();
+  for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+    int start = (this.getValue(rlepos));
+    int end = start + (this.getLength(rlepos)) + 1;
+    Util.setBitmapRange(answer.bitmap, start, end);
+  }
+  answer.cardinality = card;
+  return answer;
+}
 
-  // convert to bitmap or array *if needed*
+// convert to bitmap or array *if needed*
   private Container toEfficientContainer() {
     int sizeAsRunContainer = RunContainer.serializedSizeInBytes(this.nbrruns);
     int sizeAsBitmapContainer = BitmapContainer.serializedSizeInBytes(0);
@@ -2427,25 +2578,34 @@ public final class RunContainer extends Container implements Cloneable {
     return toBitmapOrArrayContainer(card).ixor(x);
   }
 
-  @Override
-  public Container xor(BitmapContainer x) {
-    // could be implemented as return toTemporaryBitmap().ixor(x);
-    BitmapContainer answer = x.clone();
+  
+@Override
+public Container xor(BitmapContainer x) {
+  // could be implemented as return toTemporaryBitmap().ixor(x);
+  BitmapContainer answer = x.clone();
+  if (answer.cardinality >= 0) {
     for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int start = (this.getValue(rlepos));
-      int end = start + (this.getLength(rlepos)) + 1;
-      int prevOnes = answer.cardinalityInRange(start, end);
+      final int start = this.getValue(rlepos);
+      final int end = start + this.getLength(rlepos) + 1;
+      answer.cardinality += Util.flipBitmapRangeAndCardinalityChange(answer.bitmap, start, end);
+    }
+  } else {
+    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+      final int start = this.getValue(rlepos);
+      final int end = start + this.getLength(rlepos) + 1;
       Util.flipBitmapRange(answer.bitmap, start, end);
-      answer.updateCardinality(prevOnes, end - start - prevOnes);
     }
-    if (answer.getCardinality() > ArrayContainer.DEFAULT_MAX_SIZE) {
-      return answer;
-    } else {
-      return answer.toArrayContainer();
-    }
+    answer.computeCardinality();
   }
 
-  @Override
+  if (answer.getCardinality() > ArrayContainer.DEFAULT_MAX_SIZE) {
+    return answer;
+  } else {
+    return answer.toArrayContainer();
+  }
+}
+
+@Override
   public Container xor(RunContainer x) {
     if (x.nbrruns == 0) {
       return this.clone();
@@ -2635,19 +2795,17 @@ public final class RunContainer extends Container implements Cloneable {
   }
 
   @Override
-  public BitmapContainer toBitmapContainer() {
-    int card = 0;
-    BitmapContainer answer = new BitmapContainer();
-    for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
-      int start = (this.getValue(rlepos));
-      int end = start + (this.getLength(rlepos)) + 1;
-      card += end - start;
-      Util.setBitmapRange(answer.bitmap, start, end);
-    }
-    assert card == this.getCardinality();
-    answer.cardinality = card;
-    return answer;
+public BitmapContainer toBitmapContainer() {
+  final int card = getCardinality();
+  BitmapContainer answer = new BitmapContainer();
+  for (int rlepos = 0; rlepos < this.nbrruns; ++rlepos) {
+    final int start = this.getValue(rlepos);
+    final int end = start + this.getLength(rlepos) + 1;
+    Util.setBitmapRange(answer.bitmap, start, end);
   }
+  answer.cardinality = card;
+  return answer;
+}
 
   @Override
   public void copyBitmapTo(long[] dest, int position) {

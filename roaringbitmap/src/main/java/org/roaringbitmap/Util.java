@@ -8,6 +8,12 @@ import static java.lang.Long.numberOfTrailingZeros;
 
 import java.util.Arrays;
 
+import jdk.incubator.vector.LongVector;
+import jdk.incubator.vector.ShortVector;
+import jdk.incubator.vector.VectorMask;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 /**
  * Various useful methods for roaring bitmaps.
  */
@@ -18,6 +24,31 @@ public final class Util {
    * combine a binary search with a sequential search
    */
   public static final boolean USE_HYBRID_BINSEARCH = true;
+
+// -- Vector API acceleration (jdk.incubator.vector) --
+private static final VectorSpecies<Long> LONG_SPECIES = LongVector.SPECIES_PREFERRED;
+private static final VectorSpecies<Short> SHORT_SPECIES = ShortVector.SPECIES_PREFERRED;
+
+/**
+ * Vectorized popcount over a range of words.
+ *
+ * <p>Returned value fits in an int for Roaring bitmaps (max 65536 bits per container).
+ */
+private static int vectorBitCount(final long[] bitmap, int from, int toExclusive) {
+  long sum = 0L;
+  final int lanes = LONG_SPECIES.length();
+  int i = from;
+  for (; i + lanes <= toExclusive; i += lanes) {
+    final LongVector v = LongVector.fromArray(LONG_SPECIES, bitmap, i);
+    final LongVector c = v.lanewise(VectorOperators.BIT_COUNT);
+    sum += c.reduceLanesToLong(VectorOperators.ADD);
+  }
+  for (; i < toExclusive; ++i) {
+    sum += Long.bitCount(bitmap[i]);
+  }
+  return (int) sum;
+}
+
 
   /**
    * Add value "offset" to all values in the container, producing
@@ -252,11 +283,47 @@ public final class Util {
    *         length if it is not possible.
    */
   public static int iterateUntil(char[] array, int pos, int length, int min) {
-    while (pos < length && (array[pos]) < min) {
-      pos++;
-    }
+  if (pos >= length) {
+    return length;
+  }
+  if (min <= 0) {
     return pos;
   }
+  // if min is outside the unsigned char range, we will scan to the end
+  if (min > 0xFFFF) {
+    return length;
+  }
+
+  final short xor = (short) 0x8000;
+  final short minAdj = (short) (((min & 0xFFFF) ^ 0x8000));
+
+  int i = pos;
+  final int lanes = SHORT_SPECIES.length();
+
+  // vector loop
+  for (; i + lanes <= length; i += lanes) {
+    ShortVector v = ShortVector.fromCharArray(SHORT_SPECIES, array, i);
+    // Map unsigned 16-bit to signed order by flipping the sign bit.
+    v = v.lanewise(VectorOperators.XOR, xor);
+    final VectorMask<Short> ge = v.compare(VectorOperators.GE, minAdj);
+    if (ge.anyTrue()) {
+      return i + ge.firstTrue();
+    }
+  }
+
+  // masked tail
+  if (i < length) {
+    final VectorMask<Short> inRange = SHORT_SPECIES.indexInRange(i, length);
+    ShortVector v = ShortVector.fromCharArray(SHORT_SPECIES, array, i, inRange);
+    v = v.lanewise(VectorOperators.XOR, xor);
+    final VectorMask<Short> ge = v.compare(VectorOperators.GE, minAdj, inRange);
+    if (ge.anyTrue()) {
+      return i + ge.firstTrue();
+    }
+  }
+  return length;
+}
+
 
   protected static int branchyUnsignedBinarySearch(
       final char[] array, final int begin, final int end, final char k) {
@@ -290,19 +357,47 @@ public final class Util {
    * @param bitmap2 second bitmap
    */
   public static void fillArrayAND(
-      final char[] container, final long[] bitmap1, final long[] bitmap2) {
-    int pos = 0;
-    if (bitmap1.length != bitmap2.length) {
-      throw new IllegalArgumentException("not supported");
+    final char[] container, final long[] bitmap1, final long[] bitmap2) {
+  int pos = 0;
+  if (bitmap1.length != bitmap2.length) {
+    throw new IllegalArgumentException("not supported");
+  }
+
+  final int lanes = LONG_SPECIES.length();
+  int k = 0;
+
+  // vector loop: compute word-wise op and quickly skip all-zero vectors
+  for (; k + lanes <= bitmap1.length; k += lanes) {
+    final LongVector v1 = LongVector.fromArray(LONG_SPECIES, bitmap1, k);
+    final LongVector v2 = LongVector.fromArray(LONG_SPECIES, bitmap2, k);
+    final LongVector v = v1.and(v2);
+    final VectorMask<Long> nz = v.compare(VectorOperators.NE, 0L);
+    if (!nz.anyTrue()) {
+      continue;
     }
-    for (int k = 0; k < bitmap1.length; ++k) {
-      long bitset = bitmap1[k] & bitmap2[k];
+    for (int l = 0; l < lanes; ++l) {
+      if (!nz.laneIsSet(l)) {
+        continue;
+      }
+      long bitset = v.lane(l);
+      final int base = (k + l) * 64;
       while (bitset != 0) {
-        container[pos++] = (char) (k * 64 + numberOfTrailingZeros(bitset));
+        container[pos++] = (char) (base + numberOfTrailingZeros(bitset));
         bitset &= (bitset - 1);
       }
     }
   }
+
+  // scalar tail
+  for (; k < bitmap1.length; ++k) {
+    long bitset = bitmap1[k] & bitmap2[k];
+    while (bitset != 0) {
+      container[pos++] = (char) (k * 64 + numberOfTrailingZeros(bitset));
+      bitset &= (bitset - 1);
+    }
+  }
+}
+
 
   /**
    * Compute the bitwise ANDNOT between two long arrays and write the set bits in the container.
@@ -312,19 +407,47 @@ public final class Util {
    * @param bitmap2 second bitmap
    */
   public static void fillArrayANDNOT(
-      final char[] container, final long[] bitmap1, final long[] bitmap2) {
-    int pos = 0;
-    if (bitmap1.length != bitmap2.length) {
-      throw new IllegalArgumentException("not supported");
+    final char[] container, final long[] bitmap1, final long[] bitmap2) {
+  int pos = 0;
+  if (bitmap1.length != bitmap2.length) {
+    throw new IllegalArgumentException("not supported");
+  }
+
+  final int lanes = LONG_SPECIES.length();
+  int k = 0;
+
+  // vector loop: compute word-wise op and quickly skip all-zero vectors
+  for (; k + lanes <= bitmap1.length; k += lanes) {
+    final LongVector v1 = LongVector.fromArray(LONG_SPECIES, bitmap1, k);
+    final LongVector v2 = LongVector.fromArray(LONG_SPECIES, bitmap2, k);
+    final LongVector v = v1.and(v2.not());
+    final VectorMask<Long> nz = v.compare(VectorOperators.NE, 0L);
+    if (!nz.anyTrue()) {
+      continue;
     }
-    for (int k = 0; k < bitmap1.length; ++k) {
-      long bitset = bitmap1[k] & (~bitmap2[k]);
+    for (int l = 0; l < lanes; ++l) {
+      if (!nz.laneIsSet(l)) {
+        continue;
+      }
+      long bitset = v.lane(l);
+      final int base = (k + l) * 64;
       while (bitset != 0) {
-        container[pos++] = (char) (k * 64 + numberOfTrailingZeros(bitset));
+        container[pos++] = (char) (base + numberOfTrailingZeros(bitset));
         bitset &= (bitset - 1);
       }
     }
   }
+
+  // scalar tail
+  for (; k < bitmap1.length; ++k) {
+    long bitset = bitmap1[k] & (~bitmap2[k]);
+    while (bitset != 0) {
+      container[pos++] = (char) (k * 64 + numberOfTrailingZeros(bitset));
+      bitset &= (bitset - 1);
+    }
+  }
+}
+
 
   /**
    * Compute the bitwise XOR between two long arrays and write the set bits in the container.
@@ -334,19 +457,47 @@ public final class Util {
    * @param bitmap2 second bitmap
    */
   public static void fillArrayXOR(
-      final char[] container, final long[] bitmap1, final long[] bitmap2) {
-    int pos = 0;
-    if (bitmap1.length != bitmap2.length) {
-      throw new IllegalArgumentException("not supported");
+    final char[] container, final long[] bitmap1, final long[] bitmap2) {
+  int pos = 0;
+  if (bitmap1.length != bitmap2.length) {
+    throw new IllegalArgumentException("not supported");
+  }
+
+  final int lanes = LONG_SPECIES.length();
+  int k = 0;
+
+  // vector loop: compute word-wise op and quickly skip all-zero vectors
+  for (; k + lanes <= bitmap1.length; k += lanes) {
+    final LongVector v1 = LongVector.fromArray(LONG_SPECIES, bitmap1, k);
+    final LongVector v2 = LongVector.fromArray(LONG_SPECIES, bitmap2, k);
+    final LongVector v = v1.lanewise(VectorOperators.XOR, v2);
+    final VectorMask<Long> nz = v.compare(VectorOperators.NE, 0L);
+    if (!nz.anyTrue()) {
+      continue;
     }
-    for (int k = 0; k < bitmap1.length; ++k) {
-      long bitset = bitmap1[k] ^ bitmap2[k];
+    for (int l = 0; l < lanes; ++l) {
+      if (!nz.laneIsSet(l)) {
+        continue;
+      }
+      long bitset = v.lane(l);
+      final int base = (k + l) * 64;
       while (bitset != 0) {
-        container[pos++] = (char) (k * 64 + numberOfTrailingZeros(bitset));
+        container[pos++] = (char) (base + numberOfTrailingZeros(bitset));
         bitset &= (bitset - 1);
       }
     }
   }
+
+  // scalar tail
+  for (; k < bitmap1.length; ++k) {
+    long bitset = bitmap1[k] ^ bitmap2[k];
+    while (bitset != 0) {
+      container[pos++] = (char) (k * 64 + numberOfTrailingZeros(bitset));
+      bitset &= (bitset - 1);
+    }
+  }
+}
+
 
   /**
    * flip bits at start, start+1,..., end-1
@@ -356,17 +507,36 @@ public final class Util {
    * @param end last index to be modified (exclusive)
    */
   public static void flipBitmapRange(long[] bitmap, int start, int end) {
-    if (start == end) {
-      return;
-    }
-    int firstword = start / 64;
-    int endword = (end - 1) / 64;
-    bitmap[firstword] ^= ~(~0L << start);
-    for (int i = firstword; i < endword; i++) {
-      bitmap[i] = ~bitmap[i];
-    }
-    bitmap[endword] ^= ~0L >>> -end;
+  if (start == end) {
+    return;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    bitmap[firstword] ^= ((~0L << start) & (~0L >>> -end));
+    return;
+  }
+
+  // first partial / full word
+  bitmap[firstword] ^= (~0L << start);
+
+  // middle full words
+  int i = firstword + 1;
+  final int limit = endword; // exclusive
+  final int lanes = LONG_SPECIES.length();
+  for (; i + lanes <= limit; i += lanes) {
+    final LongVector v = LongVector.fromArray(LONG_SPECIES, bitmap, i);
+    v.not().intoArray(bitmap, i);
+  }
+  for (; i < limit; ++i) {
+    bitmap[i] = ~bitmap[i];
+  }
+
+  // last partial / full word
+  bitmap[endword] ^= (~0L >>> -end);
+}
+
 
   /**
    * Hamming weight of the 64-bit words involved in the range
@@ -381,17 +551,15 @@ public final class Util {
    */
   @Deprecated
   public static int cardinalityInBitmapWordRange(long[] bitmap, int start, int end) {
-    if (start >= end) {
-      return 0;
-    }
-    int firstword = start / 64;
-    int endword = (end - 1) / 64;
-    int answer = 0;
-    for (int i = firstword; i <= endword; i++) {
-      answer += Long.bitCount(bitmap[i]);
-    }
-    return answer;
+  if (start >= end) {
+    return 0;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+  // inclusive word range -> exclusive upper bound
+  return vectorBitCount(bitmap, firstword, endword + 1);
+}
+
 
   /**
    * Hamming weight of the bitset in the range
@@ -403,21 +571,29 @@ public final class Util {
    * @return the hamming weight of the corresponding range
    */
   public static int cardinalityInBitmapRange(long[] bitmap, int start, int end) {
-    if (start >= end) {
-      return 0;
-    }
-    int firstword = start / 64;
-    int endword = (end - 1) / 64;
-    if (firstword == endword) {
-      return Long.bitCount(bitmap[firstword] & ((~0L << start) & (~0L >>> -end)));
-    }
-    int answer = Long.bitCount(bitmap[firstword] & (~0L << start));
-    for (int i = firstword + 1; i < endword; i++) {
-      answer += Long.bitCount(bitmap[i]);
-    }
-    answer += Long.bitCount(bitmap[endword] & (~0L >>> -end));
-    return answer;
+  if (start >= end) {
+    return 0;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    return Long.bitCount(bitmap[firstword] & ((~0L << start) & (~0L >>> -end)));
+  }
+
+  int answer = Long.bitCount(bitmap[firstword] & (~0L << start));
+
+  // middle full words
+  final int from = firstword + 1;
+  final int toExclusive = endword;
+  if (from < toExclusive) {
+    answer += vectorBitCount(bitmap, from, toExclusive);
+  }
+
+  answer += Long.bitCount(bitmap[endword] & (~0L >>> -end));
+  return answer;
+}
+
 
   protected static char highbits(int x) {
     return (char) (x >>> 16);
@@ -492,22 +668,26 @@ public final class Util {
    * @param end last index to be modified (exclusive)
    */
   public static void resetBitmapRange(long[] bitmap, int start, int end) {
-    if (start == end) {
-      return;
-    }
-    int firstword = start / 64;
-    int endword = (end - 1) / 64;
-
-    if (firstword == endword) {
-      bitmap[firstword] &= ~((~0L << start) & (~0L >>> -end));
-      return;
-    }
-    bitmap[firstword] &= ~(~0L << start);
-    for (int i = firstword + 1; i < endword; i++) {
-      bitmap[i] = 0;
-    }
-    bitmap[endword] &= ~(~0L >>> -end);
+  if (start == end) {
+    return;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    bitmap[firstword] &= ~((~0L << start) & (~0L >>> -end));
+    return;
+  }
+
+  bitmap[firstword] &= ~(~0L << start);
+
+  if (firstword + 1 < endword) {
+    Arrays.fill(bitmap, firstword + 1, endword, 0L);
+  }
+
+  bitmap[endword] &= ~(~0L >>> -end);
+}
+
 
   /**
    * Intersects the bitmap with the array, returning the cardinality of the result
@@ -602,21 +782,26 @@ public final class Util {
    * @param end last index to be modified (exclusive)
    */
   public static void setBitmapRange(long[] bitmap, int start, int end) {
-    if (start == end) {
-      return;
-    }
-    int firstword = start / 64;
-    int endword = (end - 1) / 64;
-    if (firstword == endword) {
-      bitmap[firstword] |= (~0L << start) & (~0L >>> -end);
-      return;
-    }
-    bitmap[firstword] |= ~0L << start;
-    for (int i = firstword + 1; i < endword; i++) {
-      bitmap[i] = ~0L;
-    }
-    bitmap[endword] |= ~0L >>> -end;
+  if (start == end) {
+    return;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    bitmap[firstword] |= (~0L << start) & (~0L >>> -end);
+    return;
+  }
+
+  bitmap[firstword] |= (~0L << start);
+
+  if (firstword + 1 < endword) {
+    Arrays.fill(bitmap, firstword + 1, endword, ~0L);
+  }
+
+  bitmap[endword] |= (~0L >>> -end);
+}
+
 
   /**
    * set bits at start, start+1,..., end-1 and report the
@@ -629,11 +814,54 @@ public final class Util {
    */
   @Deprecated
   public static int setBitmapRangeAndCardinalityChange(long[] bitmap, int start, int end) {
-    int cardbefore = cardinalityInBitmapWordRange(bitmap, start, end);
-    setBitmapRange(bitmap, start, end);
-    int cardafter = cardinalityInBitmapWordRange(bitmap, start, end);
-    return cardafter - cardbefore;
+  if (start >= end) {
+    return 0;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    final long mask = ((~0L << start) & (~0L >>> -end));
+    final long w = bitmap[firstword];
+    final int change = Long.bitCount((~w) & mask);
+    bitmap[firstword] = w | mask;
+    return change;
+  }
+
+  int change = 0;
+
+  // first (partial or full) word
+  final long firstMask = (~0L << start);
+  long w = bitmap[firstword];
+  change += Long.bitCount((~w) & firstMask);
+  bitmap[firstword] = w | firstMask;
+
+  // middle full words: set to all ones
+  int i = firstword + 1;
+  final int limit = endword; // exclusive
+  final int lanes = LONG_SPECIES.length();
+  final LongVector allOnes = LongVector.broadcast(LONG_SPECIES, ~0L);
+  for (; i + lanes <= limit; i += lanes) {
+    final LongVector v = LongVector.fromArray(LONG_SPECIES, bitmap, i);
+    final long ones = v.lanewise(VectorOperators.BIT_COUNT).reduceLanesToLong(VectorOperators.ADD);
+    change += (lanes << 6) - (int) ones;
+    allOnes.intoArray(bitmap, i);
+  }
+  for (; i < limit; ++i) {
+    w = bitmap[i];
+    change += 64 - Long.bitCount(w);
+    bitmap[i] = ~0L;
+  }
+
+  // last (partial or full) word
+  final long lastMask = (~0L >>> -end);
+  w = bitmap[endword];
+  change += Long.bitCount((~w) & lastMask);
+  bitmap[endword] = w | lastMask;
+
+  return change;
+}
+
 
   /**
    * flip  bits at start, start+1,..., end-1 and report the
@@ -646,11 +874,59 @@ public final class Util {
    */
   @Deprecated
   public static int flipBitmapRangeAndCardinalityChange(long[] bitmap, int start, int end) {
-    int cardbefore = cardinalityInBitmapWordRange(bitmap, start, end);
-    flipBitmapRange(bitmap, start, end);
-    int cardafter = cardinalityInBitmapWordRange(bitmap, start, end);
-    return cardafter - cardbefore;
+  if (start >= end) {
+    return 0;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    final long mask = ((~0L << start) & (~0L >>> -end));
+    final long w = bitmap[firstword];
+    final int ones = Long.bitCount(w & mask);
+    bitmap[firstword] = w ^ mask;
+    final int rangeLen = end - start;
+    return rangeLen - (ones << 1);
+  }
+
+  int change = 0;
+
+  // first (partial or full) word
+  final long firstMask = (~0L << start);
+  long w = bitmap[firstword];
+  final int onesFirst = Long.bitCount(w & firstMask);
+  bitmap[firstword] = w ^ firstMask;
+  final int firstLen = ((firstword + 1) << 6) - start;
+  change += firstLen - (onesFirst << 1);
+
+  // middle full words: invert
+  int i = firstword + 1;
+  final int limit = endword; // exclusive
+  final int lanes = LONG_SPECIES.length();
+  for (; i + lanes <= limit; i += lanes) {
+    final LongVector v = LongVector.fromArray(LONG_SPECIES, bitmap, i);
+    final long ones = v.lanewise(VectorOperators.BIT_COUNT).reduceLanesToLong(VectorOperators.ADD);
+    change += (lanes << 6) - (int) (ones << 1);
+    v.not().intoArray(bitmap, i);
+  }
+  for (; i < limit; ++i) {
+    w = bitmap[i];
+    final int ones = Long.bitCount(w);
+    change += 64 - (ones << 1);
+    bitmap[i] = ~w;
+  }
+
+  // last (partial or full) word
+  final long lastMask = (~0L >>> -end);
+  w = bitmap[endword];
+  final int onesLast = Long.bitCount(w & lastMask);
+  bitmap[endword] = w ^ lastMask;
+  final int lastLen = end - (endword << 6);
+  change += lastLen - (onesLast << 1);
+
+  return change;
+}
+
 
   /**
    * reset  bits at start, start+1,..., end-1 and report the
@@ -663,11 +939,54 @@ public final class Util {
    */
   @Deprecated
   public static int resetBitmapRangeAndCardinalityChange(long[] bitmap, int start, int end) {
-    int cardbefore = cardinalityInBitmapWordRange(bitmap, start, end);
-    resetBitmapRange(bitmap, start, end);
-    int cardafter = cardinalityInBitmapWordRange(bitmap, start, end);
-    return cardafter - cardbefore;
+  if (start >= end) {
+    return 0;
   }
+  final int firstword = start >>> 6;
+  final int endword = (end - 1) >>> 6;
+
+  if (firstword == endword) {
+    final long mask = ((~0L << start) & (~0L >>> -end));
+    final long w = bitmap[firstword];
+    final int cleared = Long.bitCount(w & mask);
+    bitmap[firstword] = w & ~mask;
+    return -cleared;
+  }
+
+  int change = 0;
+
+  // first (partial or full) word
+  final long firstMask = (~0L << start);
+  long w = bitmap[firstword];
+  change -= Long.bitCount(w & firstMask);
+  bitmap[firstword] = w & ~firstMask;
+
+  // middle full words: clear to zero
+  int i = firstword + 1;
+  final int limit = endword; // exclusive
+  final int lanes = LONG_SPECIES.length();
+  final LongVector zeros = LongVector.zero(LONG_SPECIES);
+  for (; i + lanes <= limit; i += lanes) {
+    final LongVector v = LongVector.fromArray(LONG_SPECIES, bitmap, i);
+    final long ones = v.lanewise(VectorOperators.BIT_COUNT).reduceLanesToLong(VectorOperators.ADD);
+    change -= (int) ones;
+    zeros.intoArray(bitmap, i);
+  }
+  for (; i < limit; ++i) {
+    w = bitmap[i];
+    change -= Long.bitCount(w);
+    bitmap[i] = 0L;
+  }
+
+  // last (partial or full) word
+  final long lastMask = (~0L >>> -end);
+  w = bitmap[endword];
+  change -= Long.bitCount(w & lastMask);
+  bitmap[endword] = w & ~lastMask;
+
+  return change;
+}
+
 
   /**
    * Look for value k in array in the range [begin,end). If the value is found, return its index. If

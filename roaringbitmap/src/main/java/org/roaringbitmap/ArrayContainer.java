@@ -179,17 +179,21 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public ArrayContainer and(final ArrayContainer value2) {
-    ArrayContainer value1 = this;
-    final int desiredCapacity = Math.min(value1.getCardinality(), value2.getCardinality());
+public ArrayContainer and(final ArrayContainer value2) {
+    final ArrayContainer value1 = this;
+    final int card1 = value1.getCardinality();
+    final int card2 = value2.getCardinality();
+    if ((card1 == 0) || (card2 == 0)) {
+      return new ArrayContainer();
+    }
+    // fast disjoint check (unsigned, because char->int is 0..65535)
+    if ((value1.content[card1 - 1] < value2.content[0]) || (value2.content[card2 - 1] < value1.content[0])) {
+      return new ArrayContainer();
+    }
+    final int desiredCapacity = Math.min(card1, card2);
     ArrayContainer answer = new ArrayContainer(desiredCapacity);
     answer.cardinality =
-        Util.unsignedIntersect2by2(
-            value1.content,
-            value1.getCardinality(),
-            value2.content,
-            value2.getCardinality(),
-            answer.content);
+        Util.unsignedIntersect2by2(value1.content, card1, value2.content, card2, answer.content);
     return answer;
   }
 
@@ -205,9 +209,17 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public int andCardinality(final ArrayContainer value2) {
-    return Util.unsignedLocalIntersect2by2Cardinality(
-        content, cardinality, value2.content, value2.getCardinality());
+public int andCardinality(final ArrayContainer value2) {
+    final int card1 = this.cardinality;
+    final int card2 = value2.getCardinality();
+    if ((card1 == 0) || (card2 == 0)) {
+      return 0;
+    }
+    // fast disjoint check
+    if ((this.content[card1 - 1] < value2.content[0]) || (value2.content[card2 - 1] < this.content[0])) {
+      return 0;
+    }
+    return Util.unsignedLocalIntersect2by2Cardinality(content, card1, value2.content, card2);
   }
 
   @Override
@@ -222,28 +234,53 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public ArrayContainer andNot(final ArrayContainer value2) {
-    ArrayContainer value1 = this;
-    final int desiredCapacity = value1.getCardinality();
+public ArrayContainer andNot(final ArrayContainer value2) {
+    final ArrayContainer value1 = this;
+    final int card1 = value1.getCardinality();
+    final int card2 = value2.getCardinality();
+    if (card1 == 0) {
+      return new ArrayContainer();
+    }
+    if (card2 == 0) {
+      return value1.clone();
+    }
+    // fast disjoint check => no removal
+    if ((value1.content[card1 - 1] < value2.content[0]) || (value2.content[card2 - 1] < value1.content[0])) {
+      return value1.clone();
+    }
+    final int desiredCapacity = card1;
     ArrayContainer answer = new ArrayContainer(desiredCapacity);
     answer.cardinality =
-        Util.unsignedDifference(
-            value1.content,
-            value1.getCardinality(),
-            value2.content,
-            value2.getCardinality(),
-            answer.content);
+        Util.unsignedDifference(value1.content, card1, value2.content, card2, answer.content);
     return answer;
   }
 
   @Override
-  public ArrayContainer andNot(BitmapContainer value2) {
-    final ArrayContainer answer = new ArrayContainer(content.length);
+public ArrayContainer andNot(BitmapContainer value2) {
+    final int card = this.cardinality;
+    if (card == 0) {
+      return new ArrayContainer();
+    }
+    final ArrayContainer answer = new ArrayContainer(card);
+    final long[] bitmap = value2.bitmap;
     int pos = 0;
-    for (int k = 0; k < cardinality; ++k) {
-      char val = this.content[k];
-      answer.content[pos] = val;
-      pos += 1 - value2.bitValue(val);
+    int k = 0;
+    while (k < card) {
+      final char first = this.content[k];
+      final int wordIndex = first >>> 6;
+      final long word = bitmap[wordIndex];
+      final int base = wordIndex << 6;
+      do {
+        final char v = this.content[k];
+        final int bit = (v - base);
+        if (((word >>> bit) & 1L) == 0L) {
+          answer.content[pos++] = v;
+        }
+        ++k;
+        if (k >= card) {
+          break;
+        }
+      } while ((this.content[k] >>> 6) == wordIndex);
     }
     answer.cardinality = pos;
     return answer;
@@ -551,14 +588,30 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public Container iand(BitmapContainer value2) {
+public Container iand(BitmapContainer value2) {
+    // content is sorted, so bitmap word index is non-decreasing: group by word for fewer loads
+    final long[] bitmap = value2.bitmap;
     int pos = 0;
-    for (int k = 0; k < cardinality; ++k) {
-      char v = this.content[k];
-      this.content[pos] = v;
-      pos += (int) value2.bitValue(v);
+    int k = 0;
+    final int card = this.cardinality;
+    while (k < card) {
+      final char first = this.content[k];
+      final int wordIndex = first >>> 6;
+      final long word = bitmap[wordIndex];
+      final int base = wordIndex << 6;
+      do {
+        final char v = this.content[k];
+        final int bit = (v - base);
+        if (((word >>> bit) & 1L) != 0L) {
+          this.content[pos++] = v;
+        }
+        ++k;
+        if (k >= card) {
+          break;
+        }
+      } while ((this.content[k] >>> 6) == wordIndex);
     }
-    cardinality = pos;
+    this.cardinality = pos;
     return this;
   }
 
@@ -591,12 +644,28 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public ArrayContainer iandNot(BitmapContainer value2) {
+public ArrayContainer iandNot(BitmapContainer value2) {
+    // content is sorted, so bitmap word index is non-decreasing: group by word for fewer loads
+    final long[] bitmap = value2.bitmap;
     int pos = 0;
-    for (int k = 0; k < cardinality; ++k) {
-      char v = this.content[k];
-      this.content[pos] = v;
-      pos += 1 - (int) value2.bitValue(v);
+    int k = 0;
+    final int card = this.cardinality;
+    while (k < card) {
+      final char first = this.content[k];
+      final int wordIndex = first >>> 6;
+      final long word = bitmap[wordIndex];
+      final int base = wordIndex << 6;
+      do {
+        final char v = this.content[k];
+        final int bit = (v - base);
+        if (((word >>> bit) & 1L) == 0L) {
+          this.content[pos++] = v;
+        }
+        ++k;
+        if (k >= card) {
+          break;
+        }
+      } while ((this.content[k] >>> 6) == wordIndex);
     }
     this.cardinality = pos;
     return this;
@@ -743,17 +812,60 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public Container ior(final ArrayContainer value2) {
-    int totalCardinality = this.getCardinality() + value2.getCardinality();
+public Container ior(final ArrayContainer value2) {
+    final int card1 = this.getCardinality();
+    final int card2 = value2.getCardinality();
+    final int totalCardinality = card1 + card2;
     if (totalCardinality > DEFAULT_MAX_SIZE) {
       return toBitmapContainer().lazyIOR(value2).repairAfterLazy();
     }
+    if (card2 == 0) {
+      return this;
+    }
+    if (card1 == 0) {
+      // copy value2 into this
+      if (this.content.length < card2) {
+        this.content = Arrays.copyOf(value2.content, calculateCapacity(card2));
+      } else {
+        System.arraycopy(value2.content, 0, this.content, 0, card2);
+      }
+      this.cardinality = card2;
+      return this;
+    }
+
+    // fast disjoint cases: avoid full merge
+    if (this.content[card1 - 1] < value2.content[0]) {
+      // append
+      if (totalCardinality > this.content.length) {
+        char[] destination = new char[calculateCapacity(totalCardinality)];
+        System.arraycopy(this.content, 0, destination, 0, card1);
+        System.arraycopy(value2.content, 0, destination, card1, card2);
+        this.content = destination;
+      } else {
+        System.arraycopy(value2.content, 0, this.content, card1, card2);
+      }
+      this.cardinality = totalCardinality;
+      return this;
+    } else if (value2.content[card2 - 1] < this.content[0]) {
+      // prepend
+      if (totalCardinality > this.content.length) {
+        char[] destination = new char[calculateCapacity(totalCardinality)];
+        System.arraycopy(value2.content, 0, destination, 0, card2);
+        System.arraycopy(this.content, 0, destination, card2, card1);
+        this.content = destination;
+      } else {
+        System.arraycopy(this.content, 0, this.content, card2, card1);
+        System.arraycopy(value2.content, 0, this.content, 0, card2);
+      }
+      this.cardinality = totalCardinality;
+      return this;
+    }
+
     if (totalCardinality >= content.length) {
       int newCapacity = calculateCapacity(totalCardinality);
       char[] destination = new char[newCapacity];
       cardinality =
-          Util.unsignedUnion2by2(
-              content, 0, cardinality, value2.content, 0, value2.cardinality, destination);
+          Util.unsignedUnion2by2(content, 0, cardinality, value2.content, 0, value2.cardinality, destination);
       this.content = destination;
     } else {
       System.arraycopy(content, 0, content, value2.cardinality, cardinality);
@@ -978,22 +1090,37 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public Container or(final ArrayContainer value2) {
+public Container or(final ArrayContainer value2) {
     final ArrayContainer value1 = this;
-    int totalCardinality = value1.getCardinality() + value2.getCardinality();
+    final int card1 = value1.getCardinality();
+    final int card2 = value2.getCardinality();
+    final int totalCardinality = card1 + card2;
     if (totalCardinality > DEFAULT_MAX_SIZE) {
       return toBitmapContainer().lazyIOR(value2).repairAfterLazy();
     }
+    if (card1 == 0) {
+      return value2.clone();
+    }
+    if (card2 == 0) {
+      return value1.clone();
+    }
+    // fast disjoint union (already sorted)
+    if (value1.content[card1 - 1] < value2.content[0]) {
+      ArrayContainer answer = new ArrayContainer(totalCardinality);
+      System.arraycopy(value1.content, 0, answer.content, 0, card1);
+      System.arraycopy(value2.content, 0, answer.content, card1, card2);
+      answer.cardinality = totalCardinality;
+      return answer;
+    } else if (value2.content[card2 - 1] < value1.content[0]) {
+      ArrayContainer answer = new ArrayContainer(totalCardinality);
+      System.arraycopy(value2.content, 0, answer.content, 0, card2);
+      System.arraycopy(value1.content, 0, answer.content, card2, card1);
+      answer.cardinality = totalCardinality;
+      return answer;
+    }
     ArrayContainer answer = new ArrayContainer(totalCardinality);
     answer.cardinality =
-        Util.unsignedUnion2by2(
-            value1.content,
-            0,
-            value1.getCardinality(),
-            value2.content,
-            0,
-            value2.getCardinality(),
-            answer.content);
+        Util.unsignedUnion2by2(value1.content, 0, card1, value2.content, 0, card2, answer.content);
     return answer;
   }
 
@@ -1362,20 +1489,37 @@ public final class ArrayContainer extends Container implements Cloneable {
   }
 
   @Override
-  public Container xor(final ArrayContainer value2) {
+public Container xor(final ArrayContainer value2) {
     final ArrayContainer value1 = this;
-    final int totalCardinality = value1.getCardinality() + value2.getCardinality();
+    final int card1 = value1.getCardinality();
+    final int card2 = value2.getCardinality();
+    final int totalCardinality = card1 + card2;
     if (totalCardinality > DEFAULT_MAX_SIZE) {
       return toBitmapContainer().ixor(value2);
     }
+    if (card1 == 0) {
+      return value2.clone();
+    }
+    if (card2 == 0) {
+      return value1.clone();
+    }
+    // fast disjoint xor == union
+    if (value1.content[card1 - 1] < value2.content[0]) {
+      ArrayContainer answer = new ArrayContainer(totalCardinality);
+      System.arraycopy(value1.content, 0, answer.content, 0, card1);
+      System.arraycopy(value2.content, 0, answer.content, card1, card2);
+      answer.cardinality = totalCardinality;
+      return answer;
+    } else if (value2.content[card2 - 1] < value1.content[0]) {
+      ArrayContainer answer = new ArrayContainer(totalCardinality);
+      System.arraycopy(value2.content, 0, answer.content, 0, card2);
+      System.arraycopy(value1.content, 0, answer.content, card2, card1);
+      answer.cardinality = totalCardinality;
+      return answer;
+    }
     ArrayContainer answer = new ArrayContainer(totalCardinality);
     answer.cardinality =
-        Util.unsignedExclusiveUnion2by2(
-            value1.content,
-            value1.getCardinality(),
-            value2.content,
-            value2.getCardinality(),
-            answer.content);
+        Util.unsignedExclusiveUnion2by2(value1.content, card1, value2.content, card2, answer.content);
     return answer;
   }
 
